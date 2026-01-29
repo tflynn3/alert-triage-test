@@ -1,0 +1,26 @@
+{
+  "displayName": "Pub/Sub Backlog Over 60 seconds",
+  "documentation": {
+    "content": "The alert-queue-sub subscription has messages older than 60 seconds. This indicates the consumer is not keeping up with the message rate.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Oldest unacked message age > 60s",
+      "conditionThreshold": {
+        "filter": "resource.type = \"pubsub_subscription\" AND resource.labels.subscription_id = \"alert-queue-sub\" AND metric.type = \"pubsub.googleapis.com/subscription/oldest_unacked_message_age\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 60,
+        "duration": "0s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MAX"
+          }
+        ]
+      }
+    }
+  ],
+  "combiner": "OR",
+  "enabled": true
+}

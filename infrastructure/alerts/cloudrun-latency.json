@@ -1,0 +1,26 @@
+{
+  "displayName": "Cloud Run High Latency",
+  "documentation": {
+    "content": "The hello-service is experiencing elevated request latency (p99 > 2000ms). This may indicate resource constraints or downstream issues.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Request latency p99 > 2000ms",
+      "conditionThreshold": {
+        "filter": "resource.type = \"cloud_run_revision\" AND resource.labels.service_name = \"hello-service\" AND metric.type = \"run.googleapis.com/request_latencies\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 2000,
+        "duration": "60s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_PERCENTILE_99"
+          }
+        ]
+      }
+    }
+  ],
+  "combiner": "OR",
+  "enabled": true
+}

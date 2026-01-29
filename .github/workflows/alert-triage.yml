@@ -1,0 +1,262 @@
+name: Alert Triage Agent
+
+on:
+  repository_dispatch:
+    types: [alert_triage]
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+env:
+  PROJECT_ID: alert-triage-playground
+  PROJECT_NUMBER: "75832914099"
+  WORKLOAD_IDENTITY_PROVIDER: projects/75832914099/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+  SERVICE_ACCOUNT: github-triage-agent@alert-triage-playground.iam.gserviceaccount.com
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Parse alert payload
+        id: alert
+        run: |
+          # Extract alert details from webhook payload
+          INCIDENT_ID=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.incident_id // "unknown"')
+          RESOURCE_NAME=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.resource_name // "unknown"')
+          POLICY_NAME=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.policy_name // "unknown"')
+          OBSERVED_VALUE=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.observed_value // "unknown"')
+          THRESHOLD_VALUE=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.threshold_value // "unknown"')
+          STARTED_AT=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.started_at // "unknown"')
+          STATE=$(echo '${{ toJson(github.event.client_payload) }}' | jq -r '.incident.state // "open"')
+
+          echo "incident_id=$INCIDENT_ID" >> $GITHUB_OUTPUT
+          echo "resource_name=$RESOURCE_NAME" >> $GITHUB_OUTPUT
+          echo "policy_name=$POLICY_NAME" >> $GITHUB_OUTPUT
+          echo "observed_value=$OBSERVED_VALUE" >> $GITHUB_OUTPUT
+          echo "threshold_value=$THRESHOLD_VALUE" >> $GITHUB_OUTPUT
+          echo "started_at=$STARTED_AT" >> $GITHUB_OUTPUT
+          echo "state=$STATE" >> $GITHUB_OUTPUT
+
+          echo "Alert: $POLICY_NAME on $RESOURCE_NAME (value: $OBSERVED_VALUE)"
+
+      - name: Check for duplicate issues
+        id: duplicate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check for existing issue with same incident ID from last 24 hours
+          EXISTING=$(gh issue list \
+            --search "incident:${{ steps.alert.outputs.incident_id }} in:body" \
+            --state open \
+            --json number,title \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Found existing issue #$EXISTING for this incident"
+            echo "existing_issue=$EXISTING" >> $GITHUB_OUTPUT
+            echo "is_duplicate=true" >> $GITHUB_OUTPUT
+          else
+            echo "No duplicate found"
+            echo "is_duplicate=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Search historical issues
+        id: history
+        if: steps.duplicate.outputs.is_duplicate == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Search for similar past issues
+          POLICY_NAME="${{ steps.alert.outputs.policy_name }}"
+          RESOURCE_NAME="${{ steps.alert.outputs.resource_name }}"
+
+          # Search by policy name
+          HISTORY=$(gh issue list \
+            --search "$POLICY_NAME in:title,body" \
+            --state all \
+            --limit 5 \
+            --json number,title,labels,closedAt,body \
+            --jq '[.[] | {number, title, labels: [.labels[].name], closedAt}]')
+
+          echo "historical_issues<<EOF" >> $GITHUB_OUTPUT
+          echo "$HISTORY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Install Claude Code
+        if: steps.duplicate.outputs.is_duplicate == 'false'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Run Claude triage
+        id: triage
+        if: steps.duplicate.outputs.is_duplicate == 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Build the triage prompt
+          cat > /tmp/triage-prompt.txt << 'PROMPT_EOF'
+          You are an SRE triage agent. Analyze this GCP Monitoring alert and create a triage report.
+
+          ## Alert Details
+          - **Incident ID**: ${{ steps.alert.outputs.incident_id }}
+          - **Policy Name**: ${{ steps.alert.outputs.policy_name }}
+          - **Resource**: ${{ steps.alert.outputs.resource_name }}
+          - **Observed Value**: ${{ steps.alert.outputs.observed_value }}
+          - **Threshold**: ${{ steps.alert.outputs.threshold_value }}
+          - **Started At**: ${{ steps.alert.outputs.started_at }}
+          - **State**: ${{ steps.alert.outputs.state }}
+
+          ## Historical Context
+          Previous similar issues:
+          ${{ steps.history.outputs.historical_issues }}
+
+          ## Your Tasks
+          1. Query current GCP metrics to assess the situation
+          2. Check recent logs for errors
+          3. Determine severity: CRITICAL, WARNING, or INFO
+          4. Identify the likely cause based on patterns
+          5. Recommend immediate actions
+
+          ## Output Format
+          Output a JSON object with these fields:
+          {
+            "severity": "CRITICAL|WARNING|INFO",
+            "summary": "One sentence summary",
+            "analysis": "Detailed analysis paragraph",
+            "metrics": {"metric_name": "value"},
+            "recommended_action": "What to do",
+            "related_runbook": "runbook name if applicable",
+            "confidence": 0.0-1.0
+          }
+
+          Use gcloud commands to query metrics and logs. Output ONLY the JSON.
+          PROMPT_EOF
+
+          # Load the system prompt
+          SYSTEM_PROMPT=$(cat .claude/commands/sre-triage-agent.md 2>/dev/null || echo "You are an SRE triage agent.")
+
+          # Run Claude Code
+          RESULT=$(claude -p "$(cat /tmp/triage-prompt.txt)" \
+            --allowedTools "Bash(gcloud*),Bash(curl*)" \
+            --output-format json 2>/dev/null || echo '{"severity":"WARNING","summary":"Triage incomplete","analysis":"Claude Code execution failed","metrics":{},"recommended_action":"Manual review required","confidence":0.5}')
+
+          # Extract JSON from result (handle potential wrapper)
+          TRIAGE_JSON=$(echo "$RESULT" | jq -r '.result // .' 2>/dev/null || echo "$RESULT")
+
+          echo "triage_result<<EOF" >> $GITHUB_OUTPUT
+          echo "$TRIAGE_JSON" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Issue
+        if: steps.duplicate.outputs.is_duplicate == 'false'
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Parse triage result
+          SEVERITY=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.severity // "WARNING"')
+          SUMMARY=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.summary // "Alert triage completed"')
+          ANALYSIS=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.analysis // "No analysis available"')
+          RECOMMENDED_ACTION=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.recommended_action // "Review manually"')
+          CONFIDENCE=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.confidence // 0.5')
+
+          # Map severity to label
+          case $SEVERITY in
+            CRITICAL) LABEL="severity:critical" ;;
+            WARNING) LABEL="severity:warning" ;;
+            *) LABEL="severity:info" ;;
+          esac
+
+          # Create issue body
+          cat > /tmp/issue-body.md << ISSUE_EOF
+          ## Alert Triage Report
+
+          | Field | Value |
+          |-------|-------|
+          | **Verdict** | $SEVERITY |
+          | **GCP Incident** | [${{ steps.alert.outputs.incident_id }}](https://console.cloud.google.com/monitoring/incidents/${{ steps.alert.outputs.incident_id }}?project=${{ env.PROJECT_ID }}) |
+          | **Alert Policy** | ${{ steps.alert.outputs.policy_name }} |
+          | **Resource** | ${{ steps.alert.outputs.resource_name }} |
+          | **Observed Value** | ${{ steps.alert.outputs.observed_value }} (threshold: ${{ steps.alert.outputs.threshold_value }}) |
+          | **Confidence** | ${CONFIDENCE} |
+
+          ## Summary
+          $SUMMARY
+
+          ## Analysis
+          $ANALYSIS
+
+          ## Recommended Action
+          $RECOMMENDED_ACTION
+
+          ---
+          *Automated triage by Claude Code Agent*
+          *Incident: ${{ steps.alert.outputs.incident_id }}*
+          ISSUE_EOF
+
+          # Create issue
+          ISSUE_URL=$(gh issue create \
+            --title "[$SEVERITY] ${{ steps.alert.outputs.policy_name }}" \
+            --body-file /tmp/issue-body.md \
+            --label "$LABEL" \
+            --label "triage")
+
+          echo "issue_url=$ISSUE_URL" >> $GITHUB_OUTPUT
+          echo "Created issue: $ISSUE_URL"
+
+      - name: Comment on duplicate issue
+        if: steps.duplicate.outputs.is_duplicate == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ steps.duplicate.outputs.existing_issue }} \
+            --body "**Alert Recurrence**
+
+          This alert fired again at $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          - **Observed Value**: ${{ steps.alert.outputs.observed_value }}
+          - **Threshold**: ${{ steps.alert.outputs.threshold_value }}
+          - **State**: ${{ steps.alert.outputs.state }}"
+
+      - name: Post to Google Chat
+        if: always()
+        env:
+          CHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+        run: |
+          if [ -z "$CHAT_WEBHOOK_URL" ]; then
+            echo "No Chat webhook configured, skipping"
+            exit 0
+          fi
+
+          SEVERITY=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.severity // "INFO"' 2>/dev/null)
+
+          case $SEVERITY in
+            CRITICAL) EMOJI="🔴" ;;
+            WARNING) EMOJI="🟡" ;;
+            *) EMOJI="🟢" ;;
+          esac
+
+          if [ "${{ steps.duplicate.outputs.is_duplicate }}" == "true" ]; then
+            MESSAGE="$EMOJI *Alert Recurrence*: ${{ steps.alert.outputs.policy_name }}\nExisting issue: https://github.com/${{ github.repository }}/issues/${{ steps.duplicate.outputs.existing_issue }}"
+          else
+            ISSUE_URL="${{ steps.issue.outputs.issue_url }}"
+            MESSAGE="$EMOJI *$SEVERITY*: ${{ steps.alert.outputs.policy_name }}\nResource: ${{ steps.alert.outputs.resource_name }}\nIssue: $ISSUE_URL"
+          fi
+
+          curl -s -X POST "$CHAT_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \"$MESSAGE\"}"
