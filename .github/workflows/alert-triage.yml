@@ -149,13 +149,34 @@ jobs:
           # Load the system prompt
           SYSTEM_PROMPT=$(cat .claude/commands/sre-triage-agent.md 2>/dev/null || echo "You are an SRE triage agent.")
 
-          # Run Claude Code
+          # Default fallback JSON
+          DEFAULT_JSON='{"severity":"WARNING","summary":"Triage incomplete - Claude execution failed","analysis":"The automated triage could not complete. This may be due to API issues or insufficient credits. Manual review is required.","metrics":{},"recommended_action":"Review the alert manually in GCP Console","related_runbook":"","confidence":0.3}'
+
+          # Run Claude Code and capture output
+          set +e
           RESULT=$(claude -p "$(cat /tmp/triage-prompt.txt)" \
             --allowedTools "Bash(gcloud*),Bash(curl*)" \
-            --output-format json 2>/dev/null || echo '{"severity":"WARNING","summary":"Triage incomplete","analysis":"Claude Code execution failed","metrics":{},"recommended_action":"Manual review required","confidence":0.5}')
+            --output-format json 2>&1)
+          CLAUDE_EXIT=$?
+          set -e
 
-          # Extract JSON from result (handle potential wrapper)
-          TRIAGE_JSON=$(echo "$RESULT" | jq -r '.result // .' 2>/dev/null || echo "$RESULT")
+          echo "Claude exit code: $CLAUDE_EXIT"
+          echo "Raw output: $RESULT"
+
+          # Try to extract JSON from result
+          # First try: parse as JSON directly
+          if echo "$RESULT" | jq -e . >/dev/null 2>&1; then
+            TRIAGE_JSON=$(echo "$RESULT" | jq -r '.result // .')
+          # Second try: extract JSON object from mixed output
+          elif EXTRACTED=$(echo "$RESULT" | grep -o '{[^{}]*"severity"[^{}]*}' | head -1) && [ -n "$EXTRACTED" ]; then
+            TRIAGE_JSON="$EXTRACTED"
+          # Third try: look for any JSON object
+          elif EXTRACTED=$(echo "$RESULT" | sed -n 's/.*\({.*}\).*/\1/p' | head -1) && echo "$EXTRACTED" | jq -e . >/dev/null 2>&1; then
+            TRIAGE_JSON="$EXTRACTED"
+          else
+            echo "Could not parse Claude output, using default"
+            TRIAGE_JSON="$DEFAULT_JSON"
+          fi
 
           echo "triage_result<<EOF" >> $GITHUB_OUTPUT
           echo "$TRIAGE_JSON" >> $GITHUB_OUTPUT
