@@ -160,34 +160,28 @@ jobs:
           # Try to extract JSON from result
           # Claude Code outputs JSON with result field containing agent's text output
 
-          # First: Check if output is Claude Code JSON format
+          TRIAGE_JSON=""
+
+          # First: Check if output is Claude Code JSON format with .result field
           if echo "$RESULT" | jq -e '.result' >/dev/null 2>&1; then
             RESULT_TEXT=$(echo "$RESULT" | jq -r '.result')
             echo "Extracted result text: $RESULT_TEXT"
 
-            # Try to find JSON in the result text
-            if [ -n "$RESULT_TEXT" ] && echo "$RESULT_TEXT" | grep -q '"severity"'; then
-              # Extract JSON from result text
-              TRIAGE_JSON=$(echo "$RESULT_TEXT" | grep -o '{[^}]*"severity"[^}]*}' | head -1 || echo "")
-              if [ -z "$TRIAGE_JSON" ]; then
-                # Try more aggressive extraction
-                TRIAGE_JSON=$(echo "$RESULT_TEXT" | python3 -c "import sys,re,json; t=sys.stdin.read(); m=re.search(r'\{[^{}]*\"severity\"[^{}]*\}', t); print(m.group() if m else '')" 2>/dev/null || echo "")
-              fi
+            # If result text is valid JSON with severity, use it directly
+            if echo "$RESULT_TEXT" | jq -e '.severity' >/dev/null 2>&1; then
+              TRIAGE_JSON="$RESULT_TEXT"
+              echo "Result text is valid triage JSON"
             fi
           fi
 
-          # Second: If still no JSON, try direct parsing
+          # Second: If still no JSON, check if raw result has severity
           if [ -z "$TRIAGE_JSON" ] && echo "$RESULT" | jq -e '.severity' >/dev/null 2>&1; then
             TRIAGE_JSON="$RESULT"
-          fi
-
-          # Third: Extract from raw output
-          if [ -z "$TRIAGE_JSON" ]; then
-            TRIAGE_JSON=$(echo "$RESULT" | grep -o '{[^}]*"severity"[^}]*}' | head -1 || echo "")
+            echo "Raw result is valid triage JSON"
           fi
 
           # Fallback to default
-          if [ -z "$TRIAGE_JSON" ] || ! echo "$TRIAGE_JSON" | jq -e . >/dev/null 2>&1; then
+          if [ -z "$TRIAGE_JSON" ] || ! echo "$TRIAGE_JSON" | jq -e '.severity' >/dev/null 2>&1; then
             echo "Could not parse Claude output, using default"
             TRIAGE_JSON="$DEFAULT_JSON"
           fi
