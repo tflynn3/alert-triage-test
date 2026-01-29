@@ -132,12 +132,16 @@ jobs:
           5. Recommend immediate actions
 
           ## CRITICAL: Output Requirements
-          After your investigation, you MUST output EXACTLY this JSON format as plain text (not in a code block):
+          After your investigation, output this JSON (single line, no code blocks):
 
-          {"severity":"WARNING","summary":"One sentence summary","analysis":"Detailed analysis paragraph","metrics":{},"recommended_action":"What to do","confidence":0.8}
+          {"severity":"WARNING","summary":"One sentence summary","analysis":"Detailed paragraph","infrastructure_status":[{"metric":"Pub/Sub Backlog","value":"120s","status":"warning"},{"metric":"Error Rate","value":"0%","status":"healthy"}],"recommended_action":"What to do","related_runbook":"pubsub-backlog.md","pattern":"Recurring issue, usually self-resolves","confidence":0.8}
 
-          Replace the values with your findings. Valid severity values: CRITICAL, WARNING, INFO.
-          The JSON must be valid and on a single line. This is your final output.
+          Field requirements:
+          - severity: CRITICAL, WARNING, or INFO
+          - infrastructure_status: Array of current metric readings with status (healthy/warning/critical)
+          - pattern: Summarize if this is recurring, one-time, or new pattern based on historical issues
+          - related_runbook: Suggest relevant runbook name or empty string
+          The JSON must be valid. This is your final output.
           PROMPT_EOF
 
           # Load the system prompt
@@ -199,11 +203,42 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Parse triage result
-          SEVERITY=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.severity // "WARNING"')
-          SUMMARY=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.summary // "Alert triage completed"')
-          ANALYSIS=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.analysis // "No analysis available"')
-          RECOMMENDED_ACTION=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.recommended_action // "Review manually"')
-          CONFIDENCE=$(echo '${{ steps.triage.outputs.triage_result }}' | jq -r '.confidence // 0.5')
+          TRIAGE='${{ steps.triage.outputs.triage_result }}'
+          SEVERITY=$(echo "$TRIAGE" | jq -r '.severity // "WARNING"')
+          SUMMARY=$(echo "$TRIAGE" | jq -r '.summary // "Alert triage completed"')
+          ANALYSIS=$(echo "$TRIAGE" | jq -r '.analysis // "No analysis available"')
+          RECOMMENDED_ACTION=$(echo "$TRIAGE" | jq -r '.recommended_action // "Review manually"')
+          CONFIDENCE=$(echo "$TRIAGE" | jq -r '.confidence // 0.5')
+          PATTERN=$(echo "$TRIAGE" | jq -r '.pattern // ""')
+          RUNBOOK=$(echo "$TRIAGE" | jq -r '.related_runbook // ""')
+
+          # Build infrastructure status table
+          INFRA_TABLE=$(echo "$TRIAGE" | jq -r '
+            if .infrastructure_status then
+              .infrastructure_status | map(
+                "| " + .metric + " | " + .value + " | " +
+                (if .status == "healthy" then "✅ Healthy"
+                 elif .status == "warning" then "⚠️ Warning"
+                 elif .status == "critical" then "🔴 Critical"
+                 else .status end) + " |"
+              ) | join("\n")
+            else
+              "| No metrics collected | - | - |"
+            end
+          ')
+
+          # Build related issues section from historical context
+          HISTORICAL='${{ steps.history.outputs.historical_issues }}'
+          RELATED_ISSUES=""
+          if [ -n "$HISTORICAL" ] && [ "$HISTORICAL" != "[]" ]; then
+            RELATED_ISSUES=$(echo "$HISTORICAL" | jq -r '
+              if length > 0 then
+                map("| #" + (.number|tostring) + " | " + (.closedAt // "open") + " | " + ((.labels // []) | join(", ")) + " |") | join("\n")
+              else
+                ""
+              end
+            ' 2>/dev/null || echo "")
+          fi
 
           # Map severity to label
           case $SEVERITY in
@@ -231,13 +266,46 @@ jobs:
           ## Analysis
           $ANALYSIS
 
+          ## Infrastructure Status
+          | Metric | Value | Status |
+          |--------|-------|--------|
+          $INFRA_TABLE
+
           ## Recommended Action
           $RECOMMENDED_ACTION
+
+          ISSUE_EOF
+
+          # Add pattern if present
+          if [ -n "$PATTERN" ]; then
+            echo "" >> /tmp/issue-body.md
+            echo "## Pattern" >> /tmp/issue-body.md
+            echo "$PATTERN" >> /tmp/issue-body.md
+          fi
+
+          # Add related issues if present
+          if [ -n "$RELATED_ISSUES" ]; then
+            echo "" >> /tmp/issue-body.md
+            echo "## Related Issues" >> /tmp/issue-body.md
+            echo "| Issue | Closed | Labels |" >> /tmp/issue-body.md
+            echo "|-------|--------|--------|" >> /tmp/issue-body.md
+            echo "$RELATED_ISSUES" >> /tmp/issue-body.md
+          fi
+
+          # Add runbook if present
+          if [ -n "$RUNBOOK" ]; then
+            echo "" >> /tmp/issue-body.md
+            echo "## Related Runbook" >> /tmp/issue-body.md
+            echo "[\`$RUNBOOK\`](../runbooks/$RUNBOOK)" >> /tmp/issue-body.md
+          fi
+
+          # Add footer
+          cat >> /tmp/issue-body.md << FOOTER_EOF
 
           ---
           *Automated triage by Claude Code Agent*
           *Incident: ${{ steps.alert.outputs.incident_id }}*
-          ISSUE_EOF
+          FOOTER_EOF
 
           # Create issue
           ISSUE_URL=$(gh issue create \
